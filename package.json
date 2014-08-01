@@ -1,0 +1,21 @@
+{
+  "name": "telemetry-collector",
+  "version": "1.0.0",
+  "description": "A server to receive, batch, and store incoming HTTP requests to disk.",
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/mozilla/telemetry-collector.git"
+  },
+  "bugs": "https://github.com/mozilla/telemetry-collector/issues/",
+  "homepage": "https://github.com/mozilla/telemetry-collector/",
+  "license": "MPL 2.0",
+  "author": "Mozilla (https://mozilla.org/)",
+  "readmeFilename": "README.md",
+  "engines": {
+    "node": "0.10.x"
+  },
+  "dependencies": {
+  },
+  "devDependencies": {
+  }
+}
