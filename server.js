@@ -6,6 +6,7 @@ var http = require('http');
 var fs = require('fs');
 var os = require('os');
 var url = require('url');
+var stream = require('./stream');
 
 var log_version = "v1";
 var config = {};
@@ -57,6 +58,9 @@ var timer = setInterval(function(){ rotate_time(); }, max_log_age_ms);
 
 // NOTE: This is for logging request metadata (for monitoring and stats)
 var request_log_file = config.stats_log_file || "/var/log/telemetry/telemetry-server.log";
+
+var recordStream = stream.RecordStream(log_version);
+var outStream = null;
 
 // Ensure that the given value can be stored in the given number of bytes.
 function check_max(value, num_bytes, label) {
@@ -124,6 +128,9 @@ function rotate_time() {
 
 function rotate() {
   console.log(new Date().toISOString() + ": Rotating " + log_file + " after " + log_size + " bytes");
+  // TODO: do we need to do this?:
+  recordStream.push('');
+  outStream.end();
   fs.rename(log_file, log_file + ".finished", function (err) {
     if (err) {
       console.log("Error rotating " + log_file + " (" + log_size + "): " + err);
@@ -184,95 +191,43 @@ function postRequest(request, response, process_time, callback) {
     return finish(202, request, response, "Path too long (" + path_length + " bytes). Limit is " + max_path_length + " bytes", process_time, 0);
   }
 
-  var client_ip = null;
+  var client_ip = '';
   var client_ip_length = 0;
-  var preamble_length = 15; // 1 sep + 2 path + 4 data + 8 timestamp
   if (include_ip) {
-    preamble_length += 1; // length of client_ip
     client_ip = get_client_ip(request);
     client_ip_length = Buffer.byteLength(client_ip);
     if (client_ip_length > max_ip_length) {
       console.log("Received an excessively long ip address: " + client_ip_length + " > " + max_ip_length);
       client_ip = "0.0.0.0";
-      client_ip_length = Buffer.byteLength(client_ip);
     }
   }
-  var buffer_length = client_ip_length + path_length + data_length + preamble_length;
-  var buf = new Buffer(buffer_length);
 
-  // Write the preamble so we can read the pieces back out:
-  // 1 byte record separator 0x1e (so we can find our spot if we encounter a corrupted record)
-  // [v2 only] 1 byte uint to indicate client ip address length
-  // 2 byte uint to indicate path length
-  // 4 byte uint to indicate data length
-  // 8 byte uint to indicate request timestamp (epoch) split into two 4-byte writes
-  var buffer_location = 0;
-  buf.writeUInt8(0x1e, buffer_location);                  buffer_location += 1;
-  if (include_ip) {
-    buf.writeUInt8(client_ip_length, buffer_location);    buffer_location += 1;
-  }
-  buf.writeUInt16LE(path_length, buffer_location);        buffer_location += 2;
-  buf.writeUInt32LE(data_length, buffer_location);        buffer_location += 4;
+  // TODO: return the record length so we know when to rotate.
+  var record_length = recordStream.writePreamble(client_ip, url_path, data_length, request_time, function(){
+    console.log("Process " + process.pid + " wrote a preamble");
+  });
 
-  // Blast the lack of 64 bit int support :(
-  // Standard bitwise operations treat numbers as 32-bit integers, so we have
-  // to do it the ugly way.  Note that Javascript can represent exact ints
-  // up to 2^53 so timestamps are safe for approximately a bazillion years.
-  // This produces the equivalent of a single little-endian 64-bit value (and
-  // can be read back out that way by other code).
-  buf.writeUInt32LE(request_time % 0x100000000, buffer_location);
-  buffer_location += 4;
-  buf.writeUInt32LE(Math.floor(request_time / 0x100000000), buffer_location);
-  buffer_location += 4;
-
-  if (buffer_location != preamble_length) {
-    // TODO: assert
-    console.log("ERROR: We should have written " + preamble_length +
-                "preamble bytes, but we actually wrote " + buffer_location);
-  }
-
-  if (include_ip) {
-    // Write the client ip address if need be:
-    buf.write(client_ip, buffer_location);  buffer_location += client_ip_length;
-  }
-  // Now write the path:
-  buf.write(url_path, buffer_location);     buffer_location += path_length;
-
-  // Write the data as it comes in:
   request.on('data', function(data) {
-    data.copy(buf, buffer_location);
-    buffer_location += data.length;
+    // Write the data as it comes in:
+    recordStream.write(data);
   });
 
   request.on('end', function() {
-    // Write buffered data to file.
-    // TODO: Keep a persistent fd/stream open and append, instead of opening
-    //       and closing every time we write.
-    fs.appendFile(log_file, buf, function (err) {
-      if (err) {
-        console.log("Error appending to log file: " + err);
-        // Since we can't easily recover from a partially written record, we
-        // start a new file in case of error.
-        log_file = unique_name(log_base);
-        log_size = 0;
-        log_time = request_time;
-        // TODO: can we find out how many bytes we actually wrote?
-        return finish(500, request, response, err.message, process_time, buffer_length);
-      }
-      log_size += buf.length;
-      log_time = request_time;
-      // If length of outputfile is > max_log_size, start writing a new one.
-      if (log_size > max_log_size) {
-        rotate();
-      }
-
-      // All is well, call the callback
-      callback(buffer_length);
-    });
+    console.log("Process " + process.pid + " finished writing a request.");
+    callback(record_length);
   });
+  log_size += record_length;
+  log_time = request_time;
+  // If length of outputfile is > max_log_size, start writing a new one.
+  if (log_size > max_log_size) {
+    rotate();
+  }
 }
 
 function run_server(port) {
+  outStream = fs.createWriteStream(log_file);
+  console.log("piping output to " + log_file);
+  recordStream.pipe(outStream);
   http.createServer(function(request, response) {
     var start_time = process.hrtime();
     if (request.method == "POST") {
@@ -287,6 +242,7 @@ function run_server(port) {
   }).listen(port);
   console.log("Process " + process.pid + " Listening on port " + port);
 }
+
 var cluster = require('cluster');
 var numCPUs = os.cpus().length;
 
