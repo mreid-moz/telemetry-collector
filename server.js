@@ -59,8 +59,8 @@ var timer = setInterval(function(){ rotate_time(); }, max_log_age_ms);
 // NOTE: This is for logging request metadata (for monitoring and stats)
 var request_log_file = config.stats_log_file || "/var/log/telemetry/telemetry-server.log";
 
-var recordStream = stream.RecordStream(log_version);
-var outStream = null;
+var record_stream = null;
+var out_stream = null;
 
 // Ensure that the given value can be stored in the given number of bytes.
 function check_max(value, num_bytes, label) {
@@ -113,10 +113,8 @@ function get_client_ip(request) {
 // called when the log reaches the max size and we don't need to check both
 // conditions (time and size) every time.
 function rotate_time() {
-  // Don't bother rotating empty log files (by time). Instead, assign a new
-  // name so that the timestamp reflects the contained data.
+  // Don't bother rotating empty log files (by time).
   if (log_size == 0) {
-    log_file = unique_name(log_base);
     return;
   }
   last_modified_age = new Date().getTime() - log_time;
@@ -126,20 +124,53 @@ function rotate_time() {
   }
 }
 
+function get_output_stream() {
+  // TODO: if output_type == S3, send to S3. else:
+  return fs.createWriteStream(log_file);
+}
+
+function flush_log() {
+  if (record_stream) {
+    console.log("Flushing " + log_file);
+    record_stream.end();
+    //'', 'utf8', function(){
+      if (log_size == 0) {
+        console.log("Deleting empty file");
+        // No data was written. Delete the file.
+        fs.unlink(log_file, function (err) {
+          if (err) {
+            console.log('Error deleting empty file: ' + err);
+            // TODO: throw err?
+          } else {
+            console.log('Deleted empty file instead of rotating: ' + log_file);
+          }
+        });
+      } else {
+        console.log("Rotating non-empty file after " + log_size + " bytes");
+        // Some data was written. Rename the file.
+        fs.rename(log_file, log_file + ".finished", function (err) {
+          if (err) {
+            console.log("Error rotating " + log_file + " (" + log_size + "): " + err);
+          }
+        });
+      }
+    //});
+  }
+}
+
 function rotate() {
   console.log(new Date().toISOString() + ": Rotating " + log_file + " after " + log_size + " bytes");
-  // TODO: do we need to do this?:
-  recordStream.push('');
-  outStream.end();
-  fs.rename(log_file, log_file + ".finished", function (err) {
-    if (err) {
-      console.log("Error rotating " + log_file + " (" + log_size + "): " + err);
-    }
-  });
+  flush_log();
 
-  // Start a new file whether the rename succeeded or not.
+  // Start a new file whether the flush succeeded or not.
   log_file = unique_name(log_base);
   log_size = 0;
+
+  // Set up fresh streams.
+  record_stream = stream.RecordStream(log_version);
+  out_stream = get_output_stream();
+  console.log("piping output to " + log_file);
+  record_stream.pipe(out_stream);
 }
 
 function unique_name(name) {
@@ -203,32 +234,30 @@ function postRequest(request, response, process_time, callback) {
   }
 
   // TODO: return the record length so we know when to rotate.
-  var record_length = recordStream.writePreamble(client_ip, url_path, data_length, request_time, function(){
+  var record_length = record_stream.writePreamble(client_ip, url_path, data_length, request_time, function(){
     console.log("Process " + process.pid + " wrote a preamble");
   });
 
   request.on('data', function(data) {
     // Write the data as it comes in:
-    recordStream.write(data);
+    record_stream.write(data);
   });
 
   request.on('end', function() {
     console.log("Process " + process.pid + " finished writing a request.");
+    log_size += record_length;
+    log_time = request_time;
+    // If length of outputfile is > max_log_size, start writing a new one.
+    if (log_size > max_log_size) {
+      rotate();
+    }
     callback(record_length);
   });
-  log_size += record_length;
-  log_time = request_time;
-  // If length of outputfile is > max_log_size, start writing a new one.
-  if (log_size > max_log_size) {
-    rotate();
-  }
 }
 
 function run_server(port) {
-  outStream = fs.createWriteStream(log_file);
-  console.log("piping output to " + log_file);
-  recordStream.pipe(outStream);
-  http.createServer(function(request, response) {
+  rotate();
+  var server = http.createServer(function(request, response) {
     var start_time = process.hrtime();
     if (request.method == "POST") {
       postRequest(request, response, start_time, function(bytes_written) {
@@ -239,7 +268,20 @@ function run_server(port) {
         finish(200, request, response, 'OK', start_time, 0);
       });
     }
-  }).listen(port);
+  });
+
+  server.on('error', function(e){
+    // Stop (with a message) if a server is already running.
+    if (e.code == 'EADDRINUSE') {
+      console.log("ERROR: There is already a server running on port " + port);
+      cluster.worker.kill();
+    } else {
+      // Something unexpected. Pass it along.
+      throw e;
+    }
+  });
+
+  server.listen(port);
   console.log("Process " + process.pid + " Listening on port " + port);
 }
 
@@ -257,24 +299,30 @@ if (cluster.isMaster) {
   }
 
   cluster.on('exit', function(worker, code, signal) {
-    console.log('Worker ' + worker.process.pid + ' died. Starting a new worker.');
-    // Start another one:
-    cluster.fork();
+    if (worker.suicide) {
+      // Worker killed itself on purpose. Don't fork another.
+      console.log('Worker ' + worker.process.pid + ' suicided with code ' + code);
+      process.exit(1);
+    } else {
+      // Start another one:
+      console.log('Worker ' + worker.process.pid + ' died. Respawning.');
+      cluster.fork();
+    }
     // TODO: See how long the child actually stayed alive. We don't want to
     //       fork continuously, so if the child processes are dying right away
     //       we should abort the master (and have the server respawned
     //       externally).
   });
+
+  cluster.on('disconnect', function(worker){
+    console.log('Worker ' + worker.process.pid + ' disconnected');
+  });
 } else {
   // Finalize current log files on exit.
   process.on('exit', function() {
     console.log("Received exit message in pid " + process.pid);
-    if (log_size != 0) {
-      console.log("Finalizing log file:" + log_file);
-      rotate();
-    } else {
-      console.log("No need to clean up empty log file.")
-    }
+    console.log("Finalizing log file:" + log_file);
+    flush_log();
   });
 
   // Catch signals that break the main loop. Since they don't exit directly,
