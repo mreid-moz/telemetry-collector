@@ -133,28 +133,26 @@ function flush_log() {
   if (record_stream) {
     console.log("Flushing " + log_file);
     record_stream.end();
-    //'', 'utf8', function(){
-      if (log_size == 0) {
-        console.log("Deleting empty file");
-        // No data was written. Delete the file.
-        fs.unlink(log_file, function (err) {
-          if (err) {
-            console.log('Error deleting empty file: ' + err);
-            // TODO: throw err?
-          } else {
-            console.log('Deleted empty file instead of rotating: ' + log_file);
-          }
-        });
-      } else {
-        console.log("Rotating non-empty file after " + log_size + " bytes");
-        // Some data was written. Rename the file.
-        fs.rename(log_file, log_file + ".finished", function (err) {
-          if (err) {
-            console.log("Error rotating " + log_file + " (" + log_size + "): " + err);
-          }
-        });
-      }
-    //});
+    if (log_size == 0) {
+      console.log("Deleting empty file");
+      // No data was written. Delete the file.
+      fs.unlink(log_file, function (err) {
+        if (err) {
+          console.log('Error deleting empty file: ' + err);
+          // TODO: throw err?
+        } else {
+          console.log('Deleted empty file instead of rotating: ' + log_file);
+        }
+      });
+    } else {
+      console.log("Rotating non-empty file after " + log_size + " bytes");
+      // Some data was written. Rename the file.
+      fs.rename(log_file, log_file + ".finished", function (err) {
+        if (err) {
+          console.log("Error rotating " + log_file + " (" + log_size + "): " + err);
+        }
+      });
+    }
   }
 }
 
