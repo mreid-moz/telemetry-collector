@@ -94,23 +94,25 @@ RecordStream.prototype.writePreamble = function(client_ip, path, data_length, re
 }
 
 RecordStream.prototype._transform = function(chunk, encoding, done) {
-  if (!this._record) {
-    this.emit('error', new Error('Cannot write record data before preamble'));
-    return;
-  }
+  if (chunk.length > 0) {
+    if (!this._record) {
+      this.emit('error', new Error('Cannot write record data before preamble'));
+      return;
+    }
 
-  chunk.copy(this._record, this._record_ptr);
-  this._record_ptr += chunk.length;
+    chunk.copy(this._record, this._record_ptr);
+    this._record_ptr += chunk.length;
 
-  if (this._record_ptr == this._record_length) {
-    // Record is complete.
-    this.push(this._record);
-    this._record = null;
-  } else if (this._record_ptr > this._record_length) {
-    // wtf have you done?
-    this.emit('error', new Error('You wrote too much to this record: ptr = ' + this._record_ptr + ", len = " + this._record_length));
-    this._record = null;
-    return;
+    if (this._record_ptr == this._record_length) {
+      // Record is complete.
+      this.push(this._record);
+      this._record = null;
+    } else if (this._record_ptr > this._record_length) {
+      // wtf have you done?
+      this.emit('error', new Error('You wrote too much to this record: ptr = ' + this._record_ptr + ", len = " + this._record_length));
+      this._record = null;
+      return;
+    }
   }
   done();
 };
