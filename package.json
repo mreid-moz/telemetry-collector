@@ -1,7 +1,7 @@
 {
   "name": "telemetry-collector",
   "version": "1.0.0",
-  "description": "A server to receive, batch, and store incoming HTTP requests to disk.",
+  "description": "A server to receive, batch, and store incoming HTTP requests to local disk or Amazon S3.",
   "repository": {
     "type": "git",
     "url": "git://github.com/mozilla/telemetry-collector.git"
@@ -15,6 +15,7 @@
     "node": "0.10.x"
   },
   "dependencies": {
+    "s3-streaming-upload": "0.1.x"
   },
   "devDependencies": {
   }

@@ -6,6 +6,7 @@ var http = require('http');
 var fs = require('fs');
 var os = require('os');
 var url = require('url');
+var S3 = require('s3-streaming-upload');
 var stream = require('./stream');
 
 var log_version = "v1";
@@ -51,6 +52,13 @@ var max_log_age_ms = config.max_log_age_ms || 5 * 60 * 1000; // 5 minutes in mil
 var log_file = unique_name(log_base);
 var log_time = new Date().getTime();
 var log_size = 0;
+var log_type = config.log_type || "file";
+
+// Amazon config:
+var s3_region     = config.s3_region || "us-west-2";
+var s3_access_key = config.s3_access_key || "N/A";
+var s3_secret_key = config.s3_secret_key || "N/A";
+var s3_bucket     = config.s3_bucket || "example_bucket";
 
 // We keep track of "last touched" and then rotate after current logs have
 // been untouched for max_log_age_ms.
@@ -61,6 +69,7 @@ var request_log_file = config.stats_log_file || "/var/log/telemetry/telemetry-se
 
 var record_stream = null;
 var out_stream = null;
+var uploader = null;
 
 // Ensure that the given value can be stored in the given number of bytes.
 function check_max(value, num_bytes, label) {
@@ -124,34 +133,47 @@ function rotate_time() {
   }
 }
 
-function get_output_stream() {
-  // TODO: if output_type == S3, send to S3. else:
-  return fs.createWriteStream(log_file);
+function get_full_log_filename() {
+  return log_path + "/" + log_file;
+}
+
+function get_finished_log_filename(unfinished) {
+  return unfinished + ".finished";
 }
 
 function flush_log() {
   if (record_stream) {
-    console.log("Flushing " + log_file);
+    console.log("Flushing current log");
     record_stream.end();
-    if (log_size == 0) {
-      console.log("Deleting empty file");
-      // No data was written. Delete the file.
-      fs.unlink(log_file, function (err) {
-        if (err) {
-          console.log('Error deleting empty file: ' + err);
-          // TODO: throw err?
-        } else {
-          console.log('Deleted empty file instead of rotating: ' + log_file);
-        }
-      });
-    } else {
-      console.log("Rotating non-empty file after " + log_size + " bytes");
-      // Some data was written. Rename the file.
-      fs.rename(log_file, log_file + ".finished", function (err) {
-        if (err) {
-          console.log("Error rotating " + log_file + " (" + log_size + "): " + err);
-        }
-      });
+
+    if (log_type === "file") {
+      // Snapshot the log file name in case it changes while we're flushing.
+      var log_to_be_flushed = get_full_log_filename();
+      console.log("Flushing " + log_to_be_flushed);
+      if (log_size == 0) {
+        console.log("Deleting empty file");
+        // No data was written. Delete the file.
+        fs.unlink(log_to_be_flushed, function (err) {
+          if (err) {
+            console.log('Error deleting empty file: ' + err);
+            // TODO: throw err?
+          } else {
+            console.log('Deleted empty file instead of rotating: ' + log_to_be_flushed);
+          }
+        });
+      } else {
+        console.log("Rotating non-empty file after " + log_size + " bytes");
+        // Some data was written. Rename the file.
+        var finished_name = get_finished_log_filename(log_to_be_flushed);
+        fs.rename(log_to_be_flushed, finished_name, function (err) {
+          if (err) {
+            console.log("Error rotating " + log_to_be_flushed + " (" + log_size + "): " + err);
+          }
+        });
+      }
+    } else if (log_type === "s3-streaming") {
+      // TODO: we need to wait for it to finish on shutdown.
+      console.log("don't need to do anything to flush for s3-streaming.");
     }
   }
 }
@@ -166,14 +188,44 @@ function rotate() {
 
   // Set up fresh streams.
   record_stream = stream.RecordStream(log_version);
-  out_stream = get_output_stream();
-  console.log("piping output to " + log_file);
-  record_stream.pipe(out_stream);
+
+  if (log_type === "file") {
+    out_stream = fs.createWriteStream(get_full_log_filename());
+    console.log("piping output to " + log_file);
+    record_stream.pipe(out_stream);
+  } else if (log_type === "s3-streaming") {
+    uploader = new S3.Uploader({
+      region: s3_region,
+      accessKey: s3_access_key,
+      secretKey: s3_secret_key,
+      bucket: s3_bucket,
+      objectName: get_finished_log_filename(log_file),
+      stream: record_stream,
+    });
+    uploader.on('initiated', function(uploadid){
+      console.log("upload started: " + uploadid);
+    });
+    uploader.on('uploading', function(partNum){
+      console.log("uploading " + partNum);
+    });
+    uploader.on('uploaded', function(part){
+      console.log("uploaded part " + part.etag);
+    });
+    uploader.on('completed', function(err, res){
+      console.log("upload completed");
+    });
+    uploader.on('error', function(err){
+      console.log('Errored with error', err);
+    });
+    uploader.on('failed', function(err){
+      console.log('upload failed with error', err);
+    });
+  }
 }
 
 function unique_name(name) {
   // Could use UUID, but pid + timestamp should suffice and give more useful info.
-  return log_path + "/" + name + "." + log_version + "." + os.hostname() + "." + process.pid + "." + new Date().getTime();
+  return name + "." + log_version + "." + os.hostname() + "." + process.pid + "." + new Date().getTime();
 }
 
 function getRequest(request, response, process_time, callback) {
@@ -284,7 +336,7 @@ function run_server(port) {
 }
 
 var cluster = require('cluster');
-var numCPUs = os.cpus().length;
+var numCPUs = config.num_processes || os.cpus().length;
 
 if (cluster.isMaster) {
   // Fork workers.
