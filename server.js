@@ -141,46 +141,65 @@ function get_finished_log_filename(unfinished) {
   return unfinished + ".finished";
 }
 
-function flush_log() {
+function flush_log(cb) {
   if (record_stream) {
     console.log("Flushing current log");
-    record_stream.end();
-
-    if (log_type === "file") {
-      // Snapshot the log file name in case it changes while we're flushing.
-      var log_to_be_flushed = get_full_log_filename();
-      console.log("Flushing " + log_to_be_flushed);
-      if (log_size == 0) {
-        console.log("Deleting empty file");
-        // No data was written. Delete the file.
-        fs.unlink(log_to_be_flushed, function (err) {
-          if (err) {
-            console.log('Error deleting empty file: ' + err);
-            // TODO: throw err?
-          } else {
-            console.log('Deleted empty file instead of rotating: ' + log_to_be_flushed);
-          }
+    record_stream.on('finish', function(){
+      console.log("record stream finished...");
+      if (log_type === "file") {
+        // Snapshot the log file name in case it changes while we're flushing.
+        var log_to_be_flushed = get_full_log_filename();
+        console.log("Flushing " + log_to_be_flushed);
+        if (log_size == 0) {
+          console.log("Deleting empty file");
+          // No data was written. Delete the file.
+          fs.unlink(log_to_be_flushed, function (err) {
+            if (err) {
+              console.log('Error deleting empty file: ' + err);
+              cb(err);
+            } else {
+              console.log('Deleted empty file instead of rotating: ' + log_to_be_flushed);
+              cb();
+            }
+          });
+        } else {
+          console.log("Rotating non-empty file after " + log_size + " bytes");
+          // Some data was written. Rename the file.
+          var finished_name = get_finished_log_filename(log_to_be_flushed);
+          fs.rename(log_to_be_flushed, finished_name, function (err) {
+            if (err) {
+              console.log("Error rotating " + log_to_be_flushed + " (" + log_size + "): " + err);
+              cb(err);
+            } else {
+              cb();
+            }
+          });
+        }
+      } else if (log_type === "s3-streaming") {
+        // TODO: we need to wait for it to finish on shutdown.
+        console.log("don't need to do anything to flush for s3-streaming.");
+        uploader.on('completed', function(err, res){
+          if (err) cb(err);
+          else     cb();
         });
-      } else {
-        console.log("Rotating non-empty file after " + log_size + " bytes");
-        // Some data was written. Rename the file.
-        var finished_name = get_finished_log_filename(log_to_be_flushed);
-        fs.rename(log_to_be_flushed, finished_name, function (err) {
-          if (err) {
-            console.log("Error rotating " + log_to_be_flushed + " (" + log_size + "): " + err);
-          }
+        uploader.on('failed', function(err){
+          cb(err);
         });
       }
-    } else if (log_type === "s3-streaming") {
-      // TODO: we need to wait for it to finish on shutdown.
-      console.log("don't need to do anything to flush for s3-streaming.");
-    }
+    });
+    record_stream.end();
   }
 }
 
 function rotate() {
   console.log(new Date().toISOString() + ": Rotating " + log_file + " after " + log_size + " bytes");
-  flush_log();
+  flush_log(function(err){
+    if (err) {
+      console.log("Error rotating log: " + err);
+    } else {
+      console.log("Log rotated successfully!");
+    }
+  });
 
   // Start a new file whether the flush succeeded or not.
   log_file = unique_name(log_base);
@@ -202,24 +221,24 @@ function rotate() {
       objectName: get_finished_log_filename(log_file),
       stream: record_stream,
     });
-    uploader.on('initiated', function(uploadid){
-      console.log("upload started: " + uploadid);
-    });
-    uploader.on('uploading', function(partNum){
-      console.log("uploading " + partNum);
-    });
-    uploader.on('uploaded', function(part){
-      console.log("uploaded part " + part.etag);
-    });
-    uploader.on('completed', function(err, res){
-      console.log("upload completed");
-    });
-    uploader.on('error', function(err){
-      console.log('Errored with error', err);
-    });
-    uploader.on('failed', function(err){
-      console.log('upload failed with error', err);
-    });
+    // uploader.on('initiated', function(uploadid){
+    //   console.log("upload started: " + uploadid);
+    // });
+    // uploader.on('uploading', function(partNum){
+    //   console.log("uploading " + partNum);
+    // });
+    // uploader.on('uploaded', function(part){
+    //   console.log("uploaded part " + part.etag);
+    // });
+    // uploader.on('completed', function(err, res){
+    //   console.log("upload completed");
+    // });
+    // uploader.on('error', function(err){
+    //   console.log('Errored with error', err);
+    // });
+    // uploader.on('failed', function(err){
+    //   console.log('upload failed with error', err);
+    // });
   }
 }
 
@@ -372,7 +391,13 @@ if (cluster.isMaster) {
   process.on('exit', function() {
     console.log("Received exit message in pid " + process.pid);
     console.log("Finalizing log file:" + log_file);
-    flush_log();
+    flush_log(function(err){
+      if (err) {
+        console.log("Error rotating final log: " + err);
+      } else {
+        console.log("Final log complete.")
+      }
+    });
   });
 
   // Catch signals that break the main loop. Since they don't exit directly,
