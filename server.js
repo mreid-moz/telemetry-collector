@@ -176,15 +176,9 @@ function flush_log(cb) {
           });
         }
       } else if (log_type === "s3-streaming") {
-        // TODO: we need to wait for it to finish on shutdown.
-        console.log("don't need to do anything to flush for s3-streaming.");
-        uploader.on('completed', function(err, res){
-          if (err) cb(err);
-          else     cb();
-        });
-        uploader.on('failed', function(err){
-          cb(err);
-        });
+        // Don't need to do anything special to flush for s3-streaming. We do
+        // need to wait on shutdown for the final piece to finish, but that is
+        // handled in the shutdown hooks.
       }
     });
     record_stream.end();
@@ -233,18 +227,19 @@ function rotate() {
     // uploader.on('completed', function(err, res){
     //   console.log("upload completed");
     // });
-    // uploader.on('error', function(err){
-    //   console.log('Errored with error', err);
-    // });
-    // uploader.on('failed', function(err){
-    //   console.log('upload failed with error', err);
-    // });
+    uploader.on('error', function(err){
+      console.log('S3 Upload error: ', err);
+    });
+    uploader.on('failed', function(err){
+      console.log('S3 Upload failed with error: ', err);
+    });
   }
 }
 
 function unique_name(name) {
   // Could use UUID, but pid + timestamp should suffice and give more useful info.
-  return name + "." + log_version + "." + os.hostname() + "." + process.pid + "." + new Date().getTime();
+  return [name, log_version, os.hostname(), process.pid,
+          new Date().getTime()].join(".");
 }
 
 function getRequest(request, response, process_time, callback) {
@@ -267,7 +262,9 @@ function postRequest(request, response, process_time, callback) {
   if (data_length > max_data_length) {
     // Note, the standard way to deal with "request too large" is to return
     // a HTTP Status 413, but we do not want clients to re-send large requests.
-    return finish(202, request, response, "Request too large (" + data_length + " bytes). Limit is " + max_data_length + " bytes. Server will discard submission.", process_time, 0);
+    return finish(202, request, response, "Request too large (" + data_length +
+      " bytes). Limit is " + max_data_length +
+      " bytes. Server will discard submission.", process_time, 0);
   }
   if (request.method != 'POST') {
     return finish(405, request, response, "Wrong request type", process_time, 0);
@@ -288,7 +285,8 @@ function postRequest(request, response, process_time, callback) {
   if (path_length > max_path_length) {
     // Similar to the content-length above, we would normally return 414, but
     // we don't want clients to retry these either.
-    return finish(202, request, response, "Path too long (" + path_length + " bytes). Limit is " + max_path_length + " bytes", process_time, 0);
+    return finish(202, request, response, "Path too long (" + path_length +
+      " bytes). Limit is " + max_path_length + " bytes", process_time, 0);
   }
 
   var client_ip = '';
@@ -297,15 +295,15 @@ function postRequest(request, response, process_time, callback) {
     client_ip = get_client_ip(request);
     client_ip_length = Buffer.byteLength(client_ip);
     if (client_ip_length > max_ip_length) {
-      console.log("Received an excessively long ip address: " + client_ip_length + " > " + max_ip_length);
+      console.log("Received an excessively long ip address: " +
+        client_ip_length + " > " + max_ip_length);
       client_ip = "0.0.0.0";
     }
   }
 
-  // TODO: return the record length so we know when to rotate.
-  var record_length = record_stream.writePreamble(client_ip, url_path, data_length, request_time, function(){
-    console.log("Process " + process.pid + " wrote a preamble");
-  });
+  // Based on the returned record length, we know when to rotate the log.
+  var record_length = record_stream.writePreamble(client_ip, url_path,
+                        data_length, request_time, function(){});
 
   request.on('data', function(data) {
     // Write the data as it comes in:
@@ -313,7 +311,7 @@ function postRequest(request, response, process_time, callback) {
   });
 
   request.on('end', function() {
-    console.log("Process " + process.pid + " finished writing a request.");
+    // Finished writing a request
     log_size += record_length;
     log_time = request_time;
     // If length of outputfile is > max_log_size, start writing a new one.
@@ -356,11 +354,18 @@ function run_server(port) {
 
 var cluster = require('cluster');
 var numCPUs = config.num_processes || os.cpus().length;
+var pending_children = 0;
 
 if (cluster.isMaster) {
+  // Wait for children to exit
+  process.on('SIGINT', function() {
+    console.log("Master Received SIGINT in pid " + process.pid + ", waiting for the kids...");
+  });
+
   // Fork workers.
   for (var i = 0; i < numCPUs; i++) {
     cluster.fork();
+    pending_children++;
   }
 
   if (config.motd) {
@@ -368,29 +373,49 @@ if (cluster.isMaster) {
   }
 
   cluster.on('exit', function(worker, code, signal) {
+    pending_children--;
     if (worker.suicide) {
       // Worker killed itself on purpose. Don't fork another.
       console.log('Worker ' + worker.process.pid + ' suicided with code ' + code);
-      process.exit(1);
+
+      if (pending_children === 0) {
+        console.log("No more children pending... Time to exit.")
+        process.exit(1);
+      } else {
+        console.log("Waiting for " + pending_children + " more pending children.")
+      }
     } else {
       // Start another one:
       console.log('Worker ' + worker.process.pid + ' died. Respawning.');
       cluster.fork();
+      pending_children++;
     }
     // TODO: See how long the child actually stayed alive. We don't want to
     //       fork continuously, so if the child processes are dying right away
     //       we should abort the master (and have the server respawned
     //       externally).
   });
-
-  cluster.on('disconnect', function(worker){
-    console.log('Worker ' + worker.process.pid + ' disconnected');
-  });
 } else {
   // Finalize current log files on exit.
-  process.on('exit', function() {
-    console.log("Received exit message in pid " + process.pid);
-    console.log("Finalizing log file:" + log_file);
+  process.on('SIGINT', function() {
+    console.log("Received SIGINT in pid " + process.pid);
+    if (log_size === 0) {
+      // No need to wait for the uploader to finish. Haven't written anything.
+      cluster.worker.kill();
+    }
+
+    // Exit once uploader has finished (successfully or otherwise).
+    uploader.on('completed', function(err, res){
+      if (err) console.log("Final upload completed with error: " + err);
+      else     console.log("Final upload succeeded");
+      cluster.worker.kill();
+    });
+    uploader.on('failed', function(err){
+      console.log("Final upload failed: " + err);
+      cluster.worker.kill();
+    });
+
+    // Flush the current log stream.
     flush_log(function(err){
       if (err) {
         console.log("Error rotating final log: " + err);
@@ -398,15 +423,6 @@ if (cluster.isMaster) {
         console.log("Final log complete.")
       }
     });
-  });
-
-  // Catch signals that break the main loop. Since they don't exit directly,
-  // on('exit') will also be called.
-  process.on('SIGTERM', function() {
-    console.log("Received SIGTERM in pid " + process.pid);
-  });
-  process.on('SIGINT', function() {
-    console.log("Received SIGINT in pid " + process.pid);
   });
 
   run_server(config.port || 8080);
